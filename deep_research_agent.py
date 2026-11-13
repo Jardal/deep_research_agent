@@ -3,13 +3,13 @@ import os
 import time
 import requests
 
-# Konfigurace lokálního serveru (např. llama-server z Prism-ML)
+# Konfigurace lokálního serveru (např. llama-server s 27B ternárním modelem)
 LLAMA_SERVER_URL = "http://localhost:8080/v1/chat/completions"
-KV_RESET_URL = "http://localhost:8080/slots"  # Endpoint pro správu slotů/KV cache v llama.cpp
+KV_RESET_URL = "http://localhost:8080/slots/0?action=erase"
 
 
 class ResearchMemory:
-  """Třívrstvá RAG paměť pro uchovávání stavu výzkumu v rámci aktuální session."""
+  """Třívrstvá RAG paměť pro uchovávání stavu výzkumu v hlavní větvi."""
 
   def __init__(self):
     self.confirmed_facts = []  # Ověřené a získané informace
@@ -27,7 +27,6 @@ class ResearchMemory:
   def add_dead_end(self, dead_end):
     if dead_end not in self.dead_ends:
       self.dead_ends.append(dead_end)
-    # Pokud byla otázka v otevřených, odstraníme ji
     if dead_end in self.open_questions:
       self.open_questions.remove(dead_end)
 
@@ -44,8 +43,8 @@ class ResearchMemory:
 """
 
 
-def call_llm(system_prompt, user_content):
-  """Komunikace s lokálním llama-serverem (OpenAI compatible API)."""
+def call_llm(system_prompt, user_content, max_tokens=800):
+  """Univerzální funkce pro komunikaci s lokálním llama-serverem."""
   headers = {"Content-Type": "application/json"}
   payload = {
       "model": "local-model",
@@ -53,8 +52,8 @@ def call_llm(system_prompt, user_content):
           {"role": "system", "content": system_prompt},
           {"role": "user", "content": user_content},
       ],
-      "temperature": 0.2,  # Nízká teplota pro faktickou přesnost a stabilitu formátu
-      "max_tokens": 800,
+      "temperature": 0.2,
+      "max_tokens": max_tokens,
   }
 
   try:
@@ -68,36 +67,55 @@ def call_llm(system_prompt, user_content):
     return "CHYBA_SERVERU"
 
 
-def reset_kv_cache():
-  """Tvrdý reset KV cache na llama-serveru přes slot management."""
+def sub_agent_extract_knowledge(raw_text_chunk, research_question):
+  """STROMOVÉ VĚTVENÍ (SUB-AGENT):
+
+  Zpracuje obří surový text v čistě statickém, izolovaném kontextu.
+  Do hlavní KV cache hlavní větve se uloží jen čistý výsledek.
+  """
   print(
-      "🧹 [KV CACHE RESET] Provádím vymazání cache a uvolnění kontextu na"
-      " serveru..."
+      "🌲 [SUB-AGENT VĚTVEVNÍ] Spouštím izolovanou analýzu surového textu"
+      " stranou od hlavního kontextu..."
+  )
+
+  system_prompt = (
+      "Jsi specializovaný rešeršní extraktor. Tvým jediným úkolem je přečíst"
+      " dodaný surový text a vyextrahovat z něj přesné, faktické body vztahující"
+      " se k zadané otázce. Ignoruj navigační prvky a šum. Piš stručně a věcně."
+  )
+  user_payload = f"VÝZKUMNÁ OTÁZKA: {research_question}\n\nSUROVÝ TEXT Z WIKISKRIPT:\n{raw_text_chunk[:8000]}"
+
+  # Voláme model jako bezstavovou funkci (neovlivňuje hlavní historii)
+  extracted_summary = call_llm(system_prompt, user_payload, max_tokens=400)
+  print("🌿 [SUB-AGENT] Analýza dokončena, dočasný kontext zahozen.")
+  return extracted_summary
+
+
+def reset_kv_cache():
+  """Tvrdý reset KV cache na llama-serveru při detekci orbity."""
+  print(
+      "🧹 [KV CACHE RESET] Mazání slotu na serveru z důvodu detekce orbity..."
   )
   try:
-    # V llama.cpp lze vynulovat slot (defaultně slot id 0)
-    requests.post(
-        f"{KV_RESET_URL}?action=save", json={}
-    )  # případně specifický endpoint dle verze llama.cpp
-    # Bezpečnější univerzální trik pro vyčištění slotu v llama-server:
-    requests.post(
-        "http://localhost:8080/slots/0?action=erase", timeout=5
-    )
+    requests.post(KV_RESET_URL, timeout=5)
     time.sleep(1)
   except Exception:
-    # Pokud endpoint slotů není podporován, server to ignoruje, hlavní je že session běží dál
     pass
 
 
-def mock_wikiskript_search(term):
-  """Simulace vyhledávání v ZIM archivu / Wikiskriptech.
-
-  (Zde nahradíte reálným dotazem do lokální knihovny libzim / SQLite).
-  """
-  print(f"🔍 [ZIM SEARCH] Prohledávám Wikiskripta pro termín: '{term}'...")
-  time.sleep(0.5)  # simulace I/O operace
-  # Zde by proběhla reálná extrakce textu ze ZIM souboru
-  return f"Odborný text z Wikiskript pro pojem '{term}': Obsahuje klíčové mechanismy, patofyziologii a klinické doporučení."
+def fetch_zim_article_mock(term):
+  """Simulace čtení surového HTML/textu ze souboru .zim (Wikiskripta)."""
+  print(
+      f"🔍 [ZIM ARCHIVE] Stahuji plný text článku pro pojem: '{term}'"
+      " (potenciálně velký text)..."
+  )
+  time.sleep(0.5)
+  # Zde by v praxi proběhlo parsování přes libzim a BeautifulSoup
+  return (
+      f"[Surový text Wikiskript pro {term}]: Obsahuje detailní patofyziologii,"
+      " diagnostická kritéria, diferenciální diagnózu a terapeutické postupy,"
+      " včetně rizikových faktorů a kazuistik."
+  )
 
 
 def run_autonomous_research(initial_topic, max_iterations=30):
@@ -105,31 +123,26 @@ def run_autonomous_research(initial_topic, max_iterations=30):
   memory.add_question(initial_topic)
 
   system_prompt = (
-      "Jsi autonomní výzkumný agent. Tvým úkolem je hloubkově prozkoumat zadané"
-      " téma pomocí iterativního získávání faktů. Sleduješ strukturovanou paměť."
-      " V každém kroku musíš odpovědět POUZE v jednom z následujících formátů:\n\n"
-      "1. Pokud potřebuješ prozkoumat nový pojem z otevřených otázek, napiš:"
-      " VYHLEDAT: [přesný pojem]\n"
-      "2. Pokud máš nové zjištění, zapiš ho: FAKT: [popis zjištění]\n"
-      "3. Pokud zjistíš, že ses zacyklil, kroužíš kolem toho samého nebo narazíš"
-      " na neřešitelnou slepou uličku, napiš výhradně klíčové slovo: ORBITA\n"
-      "4. Pokud jsou všechny otevřené otázky zodpovězeny a výzkum je hotov,"
-      " napiš: VÝZKUM HOTOV"
+      "Jsi hlavní výzkumný agent. Řídíš hloubkový výzkum. Sleduješ strukturovanou"
+      " paměť. V každém kroku musíš odpovědět POUZE v jednom z formátů:\n\n"
+      "1. VYHLEDAT: [přesný pojem k prozkoumání]\n"
+      "2. FAKT: [stručný popis ověřeného zjištění]\n"
+      "3. ORBITA (pokud se točíš v kruhu nebo narážíš na slepou uličku)\n"
+      "4. VÝZKUM HOTOV"
   )
 
   print(
-      f"🚀 Spouštím hloubkový výzkum (27B model) pro téma: '{initial_topic}'\n"
+      f"🚀 Spouštím hloubkový výzkum (27B model + Sub-Agent Tree) pro téma:"
+      f" '{initial_topic}'\n"
   )
 
   for iteration in range(1, max_iterations + 1):
     print(f"\n================ ITERACE {iteration} ================")
 
-    # Pokud nemáme co zkoumat, končíme
     if not memory.open_questions:
       print("✅ Žádné další otevřené otázky. Výzkum dospěl ke konci.")
       break
 
-    # Sestavení aktuálního kontextu pro model
     current_focus = memory.open_questions[0]
     user_payload = f"""
 AKTUÁLNÍ CÍL / OTÁZKA K ŘEŠENÍ: {current_focus}
@@ -141,12 +154,12 @@ Rozhodni o dalším kroku (VYHLEDAT / FAKT / ORBITA / VÝZKUM HOTOV):
 """
 
     response = call_llm(system_prompt, user_payload).strip()
-    print(f"🤖 Odezva modelu:\n{response}\n")
+    print(f"🤖 Odezva hlavního agenta:\n{response}\n")
 
-    # --- 1. DETEKCE ORBITY (Zacyklení) ---
+    # --- 1. DETEKCE ORBITY ---
     if "ORBITA" in response:
       print(
-          "⚠️ [ORBITA DETEKOVÁNA] Agent signalizuje zacyklení nebo slepou"
+          "⚠️ [ORBITA DETEKOVÁNA] Hlavní agent signalizuje zacyklení nebo slepou"
           " uličku!"
       )
       memory.add_dead_end(current_focus)
@@ -155,44 +168,49 @@ Rozhodni o dalším kroku (VYHLEDAT / FAKT / ORBITA / VÝZKUM HOTOV):
 
     # --- 2. DOKONČENÍ VÝZKUMU ---
     if "VÝZKUM HOTOV" in response:
-      print("🎉 Agent vyhodnotil výzkum jako kompletní.")
+      print("🎉 Hlavní agent vyhodnotil výzkum jako kompletní.")
       break
 
-    # --- 3. ZPRACOVÁNÍ NÁSTROJE (VYHLEDAT) ---
+    # --- 3. VYHLEDÁVÁNÍ A STROMOVÉ VĚTVENÍ (SUB-AGENT) ---
     if "VYHLEDAT:" in response:
       try:
         term = response.split("VYHLEDAT:")[1].split("\n")[0].strip()
-        search_result = mock_wikiskript_search(term)
 
-        # Přidáme výsledek do faktů a odmažeme z otevřených otázek
-        memory.add_fact(f"Zjištění z '{term}': {search_result}")
+        # A) Získání surových dat z externího zdroje (.zim / Wikiskripta)
+        raw_article_text = fetch_zim_article_mock(term)
 
-        # Zde může model v reálném provozu generovat další podotázky z textu
-        # Pro zjednodušení harnessu přidáme do otevřených otázek související kontext
-        sub_term = f"Detailní mechanizmus: {term}"
-        memory.add_question(sub_term)
+        # B) Izolované zpracování přes Sub-Agenta (stromové odbočení)
+        # Hlavní kontext 27B modelu se nezahltí tisíci slovy surového textu.
+        distilled_knowledge = sub_agent_extract_knowledge(
+            raw_article_text, current_focus
+        )
+
+        # C) Do hlavní paměti se uloží pouze čistý extrakt
+        memory.add_fact(
+            f"Zjištění z rešerše '{term}':\n{distilled_knowledge}"
+        )
+
+        # Vygenerujeme další navazující podotázku do fronty
+        memory.add_question(f"Detailní aspekty pojmu: {term}")
 
       except Exception as e:
-        print(f"❌ Chyba při parsování příkazu VYHLEDAT: {e}")
+        print(f"❌ Chyba při zpracování nástroje VYHLEDAT: {e}")
 
     # --- 4. ZÁPIS NOVÉHO FAKTU ---
     elif "FAKT:" in response:
       try:
         fact_text = response.split("FAKT:")[1].split("\n")[0].strip()
         memory.add_fact(fact_text)
-        # Úspěšně jsme vyřešili aktuální fokus, přesuneme ho z otevřených otázek
         if current_focus in memory.open_questions:
           memory.open_questions.remove(current_focus)
       except Exception as e:
         print(f"❌ Chyba při parsování FAKTU: {e}")
 
-    # Krátká pauza mezi iteracemi pro klid procesoru a chlazení v Termuxu
     time.sleep(1)
 
-  # --- FINÁLNÍ EXPORT ZNALOSTÍ ---
+  # --- FINÁLNÍ EXPORT ---
   print("\n================ VÝZKUM DOKONČEN ================")
-  output_filename = f"vyzkum_{int(time.time())}.json"
-
+  output_filename = f"vyzkum_tree_{int(time.time())}.json"
   final_data = {
       "topic": initial_topic,
       "confirmed_facts": memory.confirmed_facts,
@@ -202,17 +220,10 @@ Rozhodni o dalším kroku (VYHLEDAT / FAKT / ORBITA / VÝZKUM HOTOV):
   with open(output_filename, "w", encoding="utf-8") as f:
     json.dump(final_data, f, ensure_ascii=False, indent=2)
 
-  print(
-      f"💾 Ověřené globální znalosti byly uloženy do souboru: {output_filename}"
-  )
-  print(
-      "Tyto znalosti nyní můžete pomocí lokálního embedding modelu začlenit do"
-      " trvalé globální RAG databáze."
-  )
+  print(f"💾 Výsledky uloženy do souboru: {output_filename}")
 
 
 if __name__ == "__main__":
-  # Příklad spuštění pro noční běh v Termuxu
   run_autonomous_research(
       initial_topic="Komplikace a patofyziologie anafylaktického šoku"
   )
